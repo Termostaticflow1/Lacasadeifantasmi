@@ -2,13 +2,12 @@ import app from "./app.js";
 import { logger } from "./lib/logger.js";
 import { createBot } from "./bot/bot.js";
 
-// ── Global crash guards ─────────────────────────────────────────────────────
-// No error of any kind should ever be able to kill this process.
+// ── Global crash guards ──────────────────────────────────────────────────────
 process.on("uncaughtException", (err) => {
-  logger.error({ err }, "uncaughtException — recovered, process continues");
+  logger.error({ err }, "uncaughtException — process continues");
 });
 process.on("unhandledRejection", (reason) => {
-  logger.error({ reason }, "unhandledRejection — recovered, process continues");
+  logger.error({ reason }, "unhandledRejection — process continues");
 });
 
 // ── Validate env ─────────────────────────────────────────────────────────────
@@ -22,50 +21,20 @@ const adminChatId = process.env["ADMIN_CHAT_ID"]!;
 if (!botToken)    throw new Error("TELEGRAM_BOT_TOKEN is required.");
 if (!adminChatId) throw new Error("ADMIN_CHAT_ID is required.");
 
-// ── Bot launcher with crash recovery ─────────────────────────────────────────
-let botRestartAttempts = 0;
-let stabilityTimer: ReturnType<typeof setTimeout> | null = null;
-
-function launchBot(delayMs = 0): void {
-  if (delayMs > 0) {
-    setTimeout(() => launchBot(0), delayMs);
-    return;
-  }
-
+// ── Bot launcher — zero delay, always immediate ──────────────────────────────
+// The bot handles all its own polling errors internally and never goes down.
+// This outer launcher is only a last-resort safety net.
+function launchBot(): void {
   try {
-    createBot(botToken, adminChatId, (code?: number) => {
-      // Cancel stability reset — bot crashed before becoming stable
-      if (stabilityTimer) { clearTimeout(stabilityTimer); stabilityTimer = null; }
-      botRestartAttempts++;
-
-      // 404 = bad token — no point retrying.
-      if (code === 404) {
-        logger.error("Bot token is invalid (404). Not restarting — check TELEGRAM_BOT_TOKEN.");
-        return;
-      }
-
-      // 409 = another instance still running on Telegram side.
-      // Wait 15 s max to let the old session expire — never 30 s.
-      const delay = code === 409
-        ? 15_000
-        : Math.min(2_000 * botRestartAttempts, 8_000); // max 8 s backoff
-
-      logger.warn({ code, delay, attempt: botRestartAttempts }, `Bot will restart in ${delay / 1000}s`);
-      launchBot(delay);
+    createBot(botToken, adminChatId, () => {
+      // onCrash is only called for truly unrecoverable errors (e.g. bad token).
+      // For everything else the bot heals itself. Relaunch immediately.
+      logger.warn("Bot onCrash called — relaunching immediately");
+      setImmediate(launchBot);
     });
-
-    // Reset attempt counter after 30 s of stable operation so future crashes
-    // always start from a short backoff instead of the accumulated one.
-    stabilityTimer = setTimeout(() => {
-      botRestartAttempts = 0;
-      stabilityTimer = null;
-    }, 30_000);
   } catch (err) {
-    if (stabilityTimer) { clearTimeout(stabilityTimer); stabilityTimer = null; }
-    botRestartAttempts++;
-    const delay = Math.min(2_000 * botRestartAttempts, 8_000);
-    logger.error({ err, delay }, `Bot failed to start — retrying in ${delay / 1000}s`);
-    launchBot(delay);
+    logger.error({ err }, "Bot failed to start — relaunching immediately");
+    setImmediate(launchBot);
   }
 }
 
@@ -78,7 +47,6 @@ app.listen(port, (err) => {
 });
 
 // ── Keep-alive self-ping every 4 minutes ─────────────────────────────────────
-// Prevents the Replit container from going to sleep due to inactivity.
 const HEALTH_URL = `http://localhost:${port}/api/healthz`;
 setInterval(async () => {
   try {
