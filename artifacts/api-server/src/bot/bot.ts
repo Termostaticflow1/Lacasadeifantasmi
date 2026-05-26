@@ -68,15 +68,37 @@ export function createBot(
 ): TelegramBot {
   const bot = new TelegramBot(token, {
     polling: {
-      interval: 300,
-      autoStart: true,
-      params: { timeout: 10 },
+      interval: 100,        // poll every 100 ms for near-instant response
+      autoStart: false,     // we start manually after flushing stale updates
+      params: { timeout: 30 },  // long-poll up to 30 s — reduces idle requests
     },
   });
 
   function isAdmin(userId: number): boolean {
     return String(userId) === String(adminChatId);
   }
+
+  // ── Flush stale updates that built up while bot was offline ───────────────
+  // getUpdates with offset=-1 returns only the very last update; adding 1 to
+  // its update_id tells Telegram "I've seen everything up to here" so we start
+  // fresh without replaying minutes-old messages.
+  (async () => {
+    try {
+      const pending = await (bot as any).getUpdates({ timeout: 0, limit: 1, offset: -1 });
+      if (Array.isArray(pending) && pending.length > 0) {
+        const lastId: number = pending[pending.length - 1].update_id;
+        await (bot as any).getUpdates({ timeout: 0, limit: 1, offset: lastId + 1 });
+        logger.info({ lastId }, "Flushed stale updates — starting fresh");
+      }
+    } catch (err: any) {
+      logger.warn({ err: err?.message }, "Could not flush stale updates — starting anyway");
+    }
+    try {
+      await bot.startPolling();
+    } catch (err: any) {
+      logger.error({ err: err?.message }, "startPolling failed after flush");
+    }
+  })();
 
   // ── Polling crash → call onCrash so index.ts can restart ─────────────────
   bot.on("polling_error", (err: any) => {

@@ -24,6 +24,7 @@ if (!adminChatId) throw new Error("ADMIN_CHAT_ID is required.");
 
 // ── Bot launcher with crash recovery ─────────────────────────────────────────
 let botRestartAttempts = 0;
+let stabilityTimer: ReturnType<typeof setTimeout> | null = null;
 
 function launchBot(delayMs = 0): void {
   if (delayMs > 0) {
@@ -33,28 +34,36 @@ function launchBot(delayMs = 0): void {
 
   try {
     createBot(botToken, adminChatId, (code?: number) => {
+      // Cancel stability reset — bot crashed before becoming stable
+      if (stabilityTimer) { clearTimeout(stabilityTimer); stabilityTimer = null; }
       botRestartAttempts++;
 
-      // 409 = another instance is still running on Telegram side (happens on
-      // quick restarts). Wait longer to let the old session expire.
       // 404 = bad token — no point retrying.
       if (code === 404) {
         logger.error("Bot token is invalid (404). Not restarting — check TELEGRAM_BOT_TOKEN.");
         return;
       }
 
+      // 409 = another instance still running on Telegram side.
+      // Wait 15 s max to let the old session expire — never 30 s.
       const delay = code === 409
-        ? 30_000  // 30 s — wait for Telegram to drop the other session
-        : Math.min(5_000 * botRestartAttempts, 60_000); // exponential backoff, max 60 s
+        ? 15_000
+        : Math.min(2_000 * botRestartAttempts, 8_000); // max 8 s backoff
 
       logger.warn({ code, delay, attempt: botRestartAttempts }, `Bot will restart in ${delay / 1000}s`);
       launchBot(delay);
     });
 
-    botRestartAttempts = 0; // reset on successful start
+    // Reset attempt counter after 30 s of stable operation so future crashes
+    // always start from a short backoff instead of the accumulated one.
+    stabilityTimer = setTimeout(() => {
+      botRestartAttempts = 0;
+      stabilityTimer = null;
+    }, 30_000);
   } catch (err) {
+    if (stabilityTimer) { clearTimeout(stabilityTimer); stabilityTimer = null; }
     botRestartAttempts++;
-    const delay = Math.min(5_000 * botRestartAttempts, 60_000);
+    const delay = Math.min(2_000 * botRestartAttempts, 8_000);
     logger.error({ err, delay }, `Bot failed to start — retrying in ${delay / 1000}s`);
     launchBot(delay);
   }
