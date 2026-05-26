@@ -64,7 +64,7 @@ async function safeSend(
 export function createBot(
   token: string,
   adminChatId: string,
-  onCrash: () => void
+  onCrash: (code?: number) => void
 ): TelegramBot {
   const bot = new TelegramBot(token, {
     polling: {
@@ -80,15 +80,10 @@ export function createBot(
 
   // ── Polling crash → call onCrash so index.ts can restart ─────────────────
   bot.on("polling_error", (err: any) => {
-    // 409 = another instance running, 404 = bad token — don't restart those
-    const code = err?.code || err?.response?.statusCode;
-    if (code === 409 || code === 404) {
-      logger.error({ err: err?.message }, "Fatal polling error — not restarting");
-      return;
-    }
-    logger.error({ err: err?.message }, "Polling error — will restart");
+    const code: number | undefined = err?.response?.statusCode ?? err?.code;
+    logger.error({ err: err?.message, code }, "Polling error — triggering restart");
     try { bot.stopPolling(); } catch {}
-    onCrash();
+    onCrash(code);
   });
 
   // ── Helpers ───────────────────────────────────────────────────────────────
