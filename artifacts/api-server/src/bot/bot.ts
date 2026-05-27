@@ -66,65 +66,69 @@ export function createBot(
   adminChatId: string,
   onCrash: (code?: number) => void
 ): TelegramBot {
-  const bot = new TelegramBot(token, {
-    polling: {
-      interval: 100,
-      autoStart: false,
-      params: { timeout: 30 },
-    },
-  });
+  // No library polling — we manage getUpdates ourselves via fetch.
+  const bot = new TelegramBot(token, { polling: false });
 
   function isAdmin(userId: number): boolean {
     return String(userId) === String(adminChatId);
   }
 
-  // ── Self-healing polling ───────────────────────────────────────────────────
-  // Flushes stale messages, then starts polling. On ANY error it immediately
-  // restarts polling — no delays, no crashes, no onCrash calls.
-  // onCrash is only used for fatal errors (invalid token = 404).
-  let pollingActive = false;
+  // ── Manual polling loop ───────────────────────────────────────────────────
+  // A plain while(true) loop calling the Telegram getUpdates API directly.
+  // No library state, no flags, no bugs. On any network error it waits 200ms
+  // and retries. The only way it stops is if the token is invalid (404).
+  (async () => {
+    const api = `https://api.telegram.org/bot${token}`;
+    let offset = 0;
 
-  async function startPollingLoop(): Promise<void> {
-    if (pollingActive) return;
-    pollingActive = true;
-
-    // Flush stale updates so old queued messages are not replayed
+    // Flush any stale updates queued while the bot was offline
     try {
-      const pending = await (bot as any).getUpdates({ timeout: 0, limit: 1, offset: -1 });
-      if (Array.isArray(pending) && pending.length > 0) {
-        const lastId: number = pending[pending.length - 1].update_id;
-        await (bot as any).getUpdates({ timeout: 0, limit: 1, offset: lastId + 1 });
-        logger.info({ lastId }, "Flushed stale updates");
+      const r = await fetch(`${api}/getUpdates?timeout=0&limit=1&offset=-1`);
+      const j = await r.json() as any;
+      if (j.ok && j.result?.length > 0) {
+        offset = j.result[j.result.length - 1].update_id + 1;
+        logger.info({ offset }, "Flushed stale updates, starting fresh");
       }
-    } catch { /* non-fatal — just start polling anyway */ }
+    } catch { /* ignore, start from 0 */ }
 
-    try {
-      await bot.startPolling();
-    } catch (err: any) {
-      logger.error({ err: err?.message }, "startPolling error — retrying immediately");
-      pollingActive = false;
-      setImmediate(startPollingLoop);
+    logger.info("Manual polling loop started");
+
+    while (true) {
+      try {
+        const r = await fetch(
+          `${api}/getUpdates?timeout=30&offset=${offset}&allowed_updates=["message","callback_query"]`,
+          { signal: AbortSignal.timeout(40_000) }  // hard timeout beyond Telegram's own
+        );
+
+        // 401/404 = invalid token — fatal, do not retry
+        if (r.status === 401 || r.status === 404) {
+          logger.error({ status: r.status }, "Invalid bot token — stopping polling");
+          onCrash(404);
+          return;
+        }
+
+        if (!r.ok) {
+          logger.warn({ status: r.status }, "getUpdates non-ok — retrying in 200ms");
+          await new Promise(res => setTimeout(res, 200));
+          continue;
+        }
+
+        const j = await r.json() as any;
+        if (!j.ok || !Array.isArray(j.result)) {
+          await new Promise(res => setTimeout(res, 200));
+          continue;
+        }
+
+        for (const update of j.result) {
+          offset = update.update_id + 1;
+          try { bot.processUpdate(update); } catch { /* single update error never stops loop */ }
+        }
+      } catch {
+        // Network error / timeout — retry immediately after 200ms
+        await new Promise(res => setTimeout(res, 200));
+      }
     }
-  }
-
-  startPollingLoop();
-
-  bot.on("polling_error", (err: any) => {
-    const code: number | undefined = err?.response?.statusCode ?? err?.code;
-
-    // Invalid token — nothing we can do, report and stop
-    if (code === 404) {
-      logger.error("Invalid bot token (404) — stopping");
-      onCrash(404);
-      return;
-    }
-
-    // Every other error: stop current polling and restart immediately
-    logger.warn({ code, msg: err?.message }, "Polling error — restarting immediately");
-    pollingActive = false;
-    try { bot.stopPolling(); } catch {}
-    setImmediate(startPollingLoop);
-  });
+  })();
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
